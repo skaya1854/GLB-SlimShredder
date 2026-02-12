@@ -193,6 +193,7 @@ public class OccludedFaceRemover : EditorWindow
 
         int processedCount = 0;
         int totalRemoved = 0;
+        int deactivatedCount = 0;
 
         foreach (var kvp in _analysisResult)
         {
@@ -203,6 +204,16 @@ public class OccludedFaceRemover : EditorWindow
 
             int originalCount = GetTriangleCount(meshFilter.sharedMesh);
             if (visibleSet.Count == originalCount) continue; // Nothing to remove
+
+            // Fully occluded — deactivate instead of creating empty mesh
+            if (visibleSet.Count == 0)
+            {
+                Undo.RecordObject(meshFilter.gameObject, "Deactivate Occluded Object");
+                meshFilter.gameObject.SetActive(false);
+                totalRemoved += originalCount;
+                deactivatedCount++;
+                continue;
+            }
 
             Undo.RecordObject(meshFilter, "Remove Occluded Faces");
 
@@ -221,7 +232,9 @@ public class OccludedFaceRemover : EditorWindow
 
         EditorUtility.DisplayDialog(
             "Occluded Face Removal Complete",
-            $"Processed: {processedCount} mesh(es)\nTriangles removed: {totalRemoved:N0}",
+            $"Processed: {processedCount} mesh(es)\n"
+            + $"Deactivated: {deactivatedCount} fully occluded object(s)\n"
+            + $"Triangles removed: {totalRemoved:N0}",
             "OK");
 
         _analysisResult = null;

@@ -64,7 +64,12 @@ public static class MeshBuilder
         int count = oldToNew.Count;
         var mesh = new Mesh { name = original.name + "_clean" };
 
-        if (count == 0) return mesh;
+        if (count == 0)
+        {
+            // Set minimal vertex data so glTFast export doesn't crash
+            mesh.vertices = new Vector3[0];
+            return mesh;
+        }
 
         // Set index format BEFORE setting any vertex/index data
         if (count > 65535)
