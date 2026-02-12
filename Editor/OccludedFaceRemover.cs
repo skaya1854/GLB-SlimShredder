@@ -15,7 +15,7 @@ public class OccludedFaceRemover : EditorWindow
     private Dictionary<MeshFilter, HashSet<int>> _analysisResult;
     private Vector2 _scrollPos;
 
-    [MenuItem("KAIST/Remove Occluded Faces")]
+    [MenuItem("Tools/Remove Occluded Faces")]
     private static void ShowWindow()
     {
         var window = GetWindow<OccludedFaceRemover>("Occluded Face Remover");
@@ -23,7 +23,7 @@ public class OccludedFaceRemover : EditorWindow
         window.Show();
     }
 
-    [MenuItem("KAIST/Remove Occluded Faces", true)]
+    [MenuItem("Tools/Remove Occluded Faces", true)]
     private static bool ValidateShowWindow()
     {
         return GetSelectedMeshFilters().Length > 0;
