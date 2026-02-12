@@ -6,16 +6,16 @@ using System.Collections.Generic;
 using System.Linq;
 
 /// <summary>
-/// Visibility solver using batched RaycastCommands for performance.
+/// Visibility solver using batched RaycastCommands.
 /// Phase 1: Sphere raycasting from bounding sphere surface (batched).
-/// Phase 2: Hemisphere raycasting from unmarked triangle centers (batched, multi-direction).
+/// Phase 2: Reverse ray test — cast from outside toward each unmarked triangle,
+///          checking if it is the first surface hit (batched).
 /// </summary>
 public static class MeshOcclusionSolver
 {
     private const int TempLayer = 31;
     private static readonly int TempLayerMask = 1 << TempLayer;
     private const int BatchSize = 16384;
-    private const float NormalOffset = 0.005f;
 
     public static Dictionary<MeshFilter, HashSet<int>> SolveVisibility(
         MeshFilter[] meshes, int sphereSamples, int raysPerSample,
@@ -40,14 +40,15 @@ public static class MeshOcclusionSolver
             float maxDist = radius * 4f;
             var spherePoints = GenerateFibonacciSphere(sphereSamples);
 
-            // Phase 1: Batched sphere raycasting
+            // Phase 1: Batched sphere raycasting from bounding sphere surface
             SphereRaycastBatched(spherePoints, center, radius,
                 raysPerSample, maxDist, colliderToMesh, result);
 
             LogPhaseResult("Phase 1", meshes, result);
 
-            // Phase 2: Batched hemisphere raycasting for unmarked triangles
-            HemisphereRaycastBatched(meshes, result, hemisphereSamples, maxDist);
+            // Phase 2: Reverse ray — cast from outside toward each unmarked triangle
+            ReverseRayBatched(meshes, result, colliderToMesh,
+                hemisphereSamples, radius);
 
             LogPhaseResult("Phase 2", meshes, result);
         }
@@ -60,9 +61,10 @@ public static class MeshOcclusionSolver
         return result;
     }
 
-    /// <summary>
-    /// Phase 1: Build all sphere rays, execute in batches via RaycastCommand.
-    /// </summary>
+    // ────────────────────────────────────────────────────────────────
+    // Phase 1: Sphere Raycasting
+    // ────────────────────────────────────────────────────────────────
+
     private static void SphereRaycastBatched(
         Vector3[] spherePoints, Vector3 center, float radius,
         int raysPerSample, float maxDist,
@@ -76,12 +78,11 @@ public static class MeshOcclusionSolver
         BuildSphereRays(spherePoints, center, radius, raysPerSample, rayData);
 
         var queryParams = new QueryParameters(TempLayerMask, false,
-            QueryTriggerInteraction.Ignore);
+            QueryTriggerInteraction.Ignore, false);
 
         for (int offset = 0; offset < totalRays; offset += BatchSize)
         {
             int count = Mathf.Min(BatchSize, totalRays - offset);
-
             var commands = new NativeArray<RaycastCommand>(count, Allocator.TempJob);
             var hits = new NativeArray<RaycastHit>(count, Allocator.TempJob);
 
@@ -109,9 +110,6 @@ public static class MeshOcclusionSolver
         }
     }
 
-    /// <summary>
-    /// Fill ray origin/direction pairs for sphere raycasting with stratified jitter.
-    /// </summary>
     private static void BuildSphereRays(
         Vector3[] spherePoints, Vector3 center, float radius,
         int raysPerSample, (Vector3 origin, Vector3 dir)[] rayData)
@@ -126,7 +124,6 @@ public static class MeshOcclusionSolver
             int baseIdx = i * (1 + raysPerSample);
             rayData[baseIdx] = (origin, mainDir);
 
-            // Stratified jitter using golden angle spiral on tangent plane
             Vector3 up = Mathf.Abs(mainDir.y) < 0.999f
                 ? Vector3.up : Vector3.right;
             Vector3 tangent = Vector3.Cross(mainDir, up).normalized;
@@ -143,50 +140,74 @@ public static class MeshOcclusionSolver
         }
     }
 
-    /// <summary>
-    /// Phase 2: For each unmarked triangle, cast hemisphere rays via RaycastCommand batch.
-    /// A triangle is visible if ANY ray escapes without hitting geometry.
-    /// </summary>
-    private static void HemisphereRaycastBatched(
-        MeshFilter[] meshes, Dictionary<MeshFilter, HashSet<int>> result,
-        int hemisphereSamples, float maxDist)
+    // ────────────────────────────────────────────────────────────────
+    // Phase 2: Reverse Ray Visibility Test
+    // For each unmarked triangle, cast rays FROM outside TOWARD its center.
+    // If the first hit IS that triangle, it is visible from that direction.
+    // This correctly handles concave surfaces (slots, grooves, recesses).
+    // ────────────────────────────────────────────────────────────────
+
+    private static void ReverseRayBatched(
+        MeshFilter[] meshes,
+        Dictionary<MeshFilter, HashSet<int>> result,
+        Dictionary<Collider, MeshFilter> colliderToMesh,
+        int hemisphereSamples, float radius)
     {
         var unmarked = CollectUnmarkedTriangles(meshes, result);
         if (unmarked.Count == 0) return;
 
-        // Pre-filter hemisphere directions (only upper hemisphere)
+        // Build reverse lookup: MeshFilter → its temp MeshCollider
+        var meshToCollider = new Dictionary<MeshFilter, Collider>();
+        foreach (var kvp in colliderToMesh)
+            meshToCollider[kvp.Value] = kvp.Key;
+
+        // Hemisphere directions oriented around each triangle's normal
         var allDirs = GenerateFibonacciSphere(hemisphereSamples);
         var validDirs = allDirs.Where(d => d.y >= 0.05f).ToArray();
         int raysPerTri = validDirs.Length;
         int totalRays = unmarked.Count * raysPerTri;
+        float maxDist = radius * 1.5f;
 
-        Debug.Log($"[OcclusionSolver] Phase 2: {unmarked.Count} unmarked triangles × "
-                + $"{raysPerTri} directions = {totalRays} rays");
+        Debug.Log($"[OcclusionSolver] Phase 2 (Reverse Ray): {unmarked.Count} "
+                + $"triangles × {raysPerTri} dirs = {totalRays} rays");
 
         var queryParams = new QueryParameters(TempLayerMask, false,
-            QueryTriggerInteraction.Ignore);
+            QueryTriggerInteraction.Ignore, false);
         var visibleIndices = new HashSet<int>();
 
         for (int rayOffset = 0; rayOffset < totalRays; rayOffset += BatchSize)
         {
             int count = Mathf.Min(BatchSize, totalRays - rayOffset);
-
             var commands = new NativeArray<RaycastCommand>(count, Allocator.TempJob);
             var hits = new NativeArray<RaycastHit>(count, Allocator.TempJob);
 
             try
             {
-                FillHemisphereCommands(commands, count, unmarked,
-                    validDirs, raysPerTri, rayOffset, maxDist, queryParams);
+                FillReverseRayCommands(commands, count, unmarked,
+                    validDirs, raysPerTri, rayOffset, radius,
+                    maxDist, queryParams);
 
                 var handle = RaycastCommand.ScheduleBatch(commands, hits, 64);
                 handle.Complete();
 
-                // Ray miss (collider == null) means ray escaped → triangle is visible
+                // A hit that matches the expected (collider, triangleIndex)
+                // means that triangle is directly visible from that direction
                 for (int i = 0; i < count; i++)
                 {
-                    if (hits[i].collider == null)
-                        visibleIndices.Add((rayOffset + i) / raysPerTri);
+                    if (hits[i].collider == null || hits[i].triangleIndex < 0)
+                        continue;
+
+                    int triLocal = (rayOffset + i) / raysPerTri;
+                    if (visibleIndices.Contains(triLocal)) continue;
+
+                    var (mf, expectedTriIdx, _, _) = unmarked[triLocal];
+
+                    if (meshToCollider.TryGetValue(mf, out var expectedCollider)
+                        && hits[i].collider == expectedCollider
+                        && hits[i].triangleIndex == expectedTriIdx)
+                    {
+                        visibleIndices.Add(triLocal);
+                    }
                 }
             }
             finally
@@ -197,11 +218,11 @@ public static class MeshOcclusionSolver
 
             float progress = 0.7f + 0.3f * (rayOffset + count) / (float)totalRays;
             if (EditorUtility.DisplayCancelableProgressBar("Occlusion Analysis",
-                $"Phase 2: Hemisphere ({rayOffset + count}/{totalRays})", progress))
+                $"Phase 2: Reverse Ray ({rayOffset + count}/{totalRays})",
+                progress))
                 break;
         }
 
-        // Mark visible triangles
         foreach (int idx in visibleIndices)
         {
             var (mf, triIdx, _, _) = unmarked[idx];
@@ -210,14 +231,15 @@ public static class MeshOcclusionSolver
     }
 
     /// <summary>
-    /// Fill RaycastCommands for hemisphere test.
-    /// Each command fires from a triangle center along a hemisphere direction.
+    /// Build reverse ray commands: origin is placed at (triCenter + dir * radius),
+    /// ray direction points back toward triCenter (-dir).
     /// </summary>
-    private static void FillHemisphereCommands(
+    private static void FillReverseRayCommands(
         NativeArray<RaycastCommand> commands, int count,
         List<(MeshFilter mf, int triIdx, Vector3 center, Vector3 normal)> unmarked,
         Vector3[] validDirs, int raysPerTri,
-        int rayStartOffset, float maxDist, QueryParameters queryParams)
+        int rayStartOffset, float testDist,
+        float maxDist, QueryParameters queryParams)
     {
         for (int i = 0; i < count; i++)
         {
@@ -237,15 +259,18 @@ public static class MeshOcclusionSolver
                              + normal * localDir.y
                              + bitangent * localDir.z;
 
-            Vector3 origin = center + worldDir * NormalOffset;
-            commands[i] = new RaycastCommand(origin, worldDir,
+            // Origin: far from triangle along this direction
+            // Ray: points back toward the triangle center
+            Vector3 origin = center + worldDir * testDist;
+            commands[i] = new RaycastCommand(origin, -worldDir,
                 queryParams, maxDist);
         }
     }
 
-    /// <summary>
-    /// Fill NativeArray with RaycastCommands from ray data (Phase 1).
-    /// </summary>
+    // ────────────────────────────────────────────────────────────────
+    // Shared helpers
+    // ────────────────────────────────────────────────────────────────
+
     private static void FillRaycastCommands(
         NativeArray<RaycastCommand> commands,
         (Vector3 origin, Vector3 dir)[] rayData,
@@ -258,9 +283,6 @@ public static class MeshOcclusionSolver
         }
     }
 
-    /// <summary>
-    /// Process Phase 1 batch results: record first-hit triangles as visible.
-    /// </summary>
     private static void RecordPhase1Hits(
         NativeArray<RaycastHit> hits, int count,
         Dictionary<Collider, MeshFilter> colliderToMesh,
@@ -273,15 +295,14 @@ public static class MeshOcclusionSolver
             if (hit.triangleIndex < 0) continue;
             if (!colliderToMesh.TryGetValue(hit.collider, out MeshFilter mf))
                 continue;
-
             result[mf].Add(hit.triangleIndex);
         }
     }
 
-    /// <summary>
-    /// Setup temp colliders: DISABLE existing colliders to prevent ray interception,
-    /// then add our own MeshColliders on layer 31.
-    /// </summary>
+    // ────────────────────────────────────────────────────────────────
+    // Collider setup / cleanup
+    // ────────────────────────────────────────────────────────────────
+
     private static void SetupColliders(
         MeshFilter[] meshes,
         Dictionary<Collider, MeshFilter> colliderToMesh,
@@ -294,7 +315,6 @@ public static class MeshOcclusionSolver
             if (mf.sharedMesh == null) continue;
             var go = mf.gameObject;
 
-            // Disable ALL existing colliders so they don't intercept our rays
             foreach (var existingCollider in go.GetComponents<Collider>())
             {
                 if (existingCollider.enabled)
@@ -315,9 +335,6 @@ public static class MeshOcclusionSolver
         }
     }
 
-    /// <summary>
-    /// Remove temp colliders, re-enable disabled colliders, restore layers.
-    /// </summary>
     private static void CleanupColliders(
         List<MeshCollider> addedColliders,
         List<Collider> disabledColliders,
@@ -327,17 +344,19 @@ public static class MeshOcclusionSolver
         {
             if (mc != null) Object.DestroyImmediate(mc);
         }
-
         foreach (var c in disabledColliders)
         {
             if (c != null) c.enabled = true;
         }
-
         foreach (var kvp in originalLayers)
         {
             if (kvp.Key != null) kvp.Key.layer = kvp.Value;
         }
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Geometry helpers
+    // ────────────────────────────────────────────────────────────────
 
     private static Vector3[] GenerateFibonacciSphere(int samples)
     {
@@ -354,14 +373,9 @@ public static class MeshOcclusionSolver
                 Mathf.Sin(phi) * Mathf.Sin(theta),
                 Mathf.Cos(phi));
         }
-
         return points;
     }
 
-    /// <summary>
-    /// Collect all triangles not yet marked as visible.
-    /// Skips degenerate triangles (zero-area faces).
-    /// </summary>
     private static List<(MeshFilter mf, int triIdx, Vector3 center, Vector3 normal)>
         CollectUnmarkedTriangles(
             MeshFilter[] meshes,
@@ -388,12 +402,11 @@ public static class MeshOcclusionSolver
                 Vector3 v2 = tf.TransformPoint(verts[tris[t * 3 + 2]]);
 
                 Vector3 cross = Vector3.Cross(v1 - v0, v2 - v0);
-                if (cross.sqrMagnitude < 1e-10f) continue; // Skip degenerate
+                if (cross.sqrMagnitude < 1e-10f) continue;
 
                 unmarked.Add((mf, t, (v0 + v1 + v2) / 3f, cross.normalized));
             }
         }
-
         return unmarked;
     }
 
@@ -425,13 +438,12 @@ public static class MeshOcclusionSolver
         foreach (var mf in meshes)
         {
             if (mf.sharedMesh == null) continue;
-            int count = mf.sharedMesh.triangles.Length / 3;
-            totalTris += count;
+            totalTris += mf.sharedMesh.triangles.Length / 3;
             visibleTris += result[mf].Count;
         }
         float pct = totalTris > 0
             ? (float)visibleTris / totalTris * 100f : 0f;
-        Debug.Log($"[OcclusionSolver] {phase} complete: "
+        Debug.Log($"[OcclusionSolver] {phase}: "
                 + $"{visibleTris}/{totalTris} visible ({pct:F1}%)");
     }
 }
