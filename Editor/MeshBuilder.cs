@@ -1,91 +1,157 @@
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEditor;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
 /// <summary>
-/// Utility for rebuilding meshes with only visible triangles and saving them as assets.
+/// Utility for rebuilding meshes with only visible triangles.
+/// Preserves submesh structure, all UV channels, and vertex attributes precisely.
 /// </summary>
 public static class MeshBuilder
 {
     private const string MeshFolder = "Assets/Meshes";
 
     /// <summary>
-    /// Build a new mesh containing only the triangles whose indices are in visibleTriangleIndices.
-    /// Remaps vertices so unused ones are removed.
+    /// Build a new mesh containing only the triangles whose global indices
+    /// are in visibleTriangleIndices. Preserves submesh structure and
+    /// remaps vertices so unused ones are removed.
     /// </summary>
     public static Mesh BuildCleanMesh(Mesh original, HashSet<int> visibleTriangleIndices)
     {
-        var srcTriangles = original.triangles;
-
-        // Collect vertex indices referenced by visible triangles
+        // Phase 1: Iterate per-submesh to build oldToNew vertex map
+        // and collect new triangles per submesh
         var oldToNew = new Dictionary<int, int>();
-        var newTriangles = new List<int>();
+        var submeshTris = new List<int>[original.subMeshCount];
+        int globalTriIdx = 0;
 
-        for (int t = 0; t < srcTriangles.Length / 3; t++)
+        for (int sub = 0; sub < original.subMeshCount; sub++)
         {
-            if (!visibleTriangleIndices.Contains(t)) continue;
+            var subIndices = original.GetTriangles(sub);
+            int subTriCount = subIndices.Length / 3;
+            submeshTris[sub] = new List<int>();
 
-            for (int k = 0; k < 3; k++)
+            for (int t = 0; t < subTriCount; t++)
             {
-                int oldIdx = srcTriangles[t * 3 + k];
-                if (!oldToNew.ContainsKey(oldIdx))
-                    oldToNew[oldIdx] = oldToNew.Count;
-                newTriangles.Add(oldToNew[oldIdx]);
+                if (visibleTriangleIndices.Contains(globalTriIdx))
+                {
+                    for (int k = 0; k < 3; k++)
+                    {
+                        int oldIdx = subIndices[t * 3 + k];
+                        if (!oldToNew.ContainsKey(oldIdx))
+                            oldToNew[oldIdx] = oldToNew.Count;
+                        submeshTris[sub].Add(oldToNew[oldIdx]);
+                    }
+                }
+                globalTriIdx++;
             }
         }
 
-        return AssembleRemappedMesh(original, oldToNew, newTriangles);
+        // Phase 2: Remap vertex data and assemble mesh
+        return AssembleRemappedMesh(original, oldToNew, submeshTris);
     }
 
     /// <summary>
-    /// Create a new mesh by remapping vertices from the original using the old-to-new index mapping.
+    /// Create a new mesh by remapping vertices from the original.
+    /// Preserves: positions, normals, tangents, colors, UV channels 0-7,
+    /// index format, and submesh structure.
     /// </summary>
     private static Mesh AssembleRemappedMesh(
-        Mesh original, Dictionary<int, int> oldToNew, List<int> newTriangles)
+        Mesh original, Dictionary<int, int> oldToNew,
+        List<int>[] submeshTris)
     {
         int count = oldToNew.Count;
-        var srcVerts = original.vertices;
-        var srcNormals = original.normals;
-        var srcTangents = original.tangents;
-        var srcUv = original.uv;
-        var srcUv2 = original.uv2;
-        var srcColors = original.colors;
-
-        var verts = new Vector3[count];
-        var normals = srcNormals.Length > 0 ? new Vector3[count] : null;
-        var tangents = srcTangents.Length > 0 ? new Vector4[count] : null;
-        var uv = srcUv.Length > 0 ? new Vector2[count] : null;
-        var uv2 = srcUv2.Length > 0 ? new Vector2[count] : null;
-        var colors = srcColors.Length > 0 ? new Color[count] : null;
-
-        foreach (var kvp in oldToNew)
-        {
-            int o = kvp.Key, n = kvp.Value;
-            verts[n] = srcVerts[o];
-            if (normals != null) normals[n] = srcNormals[o];
-            if (tangents != null) tangents[n] = srcTangents[o];
-            if (uv != null) uv[n] = srcUv[o];
-            if (uv2 != null) uv2[n] = srcUv2[o];
-            if (colors != null) colors[n] = srcColors[o];
-        }
-
         var mesh = new Mesh { name = original.name + "_clean" };
+
+        if (count == 0) return mesh;
+
+        // Set index format BEFORE setting any vertex/index data
+        if (count > 65535)
+            mesh.indexFormat = IndexFormat.UInt32;
+
+        // Remap core vertex attributes
+        var srcVerts = original.vertices;
+        var verts = new Vector3[count];
+        foreach (var kvp in oldToNew)
+            verts[kvp.Value] = srcVerts[kvp.Key];
         mesh.vertices = verts;
-        if (normals != null) mesh.normals = normals;
-        if (tangents != null) mesh.tangents = tangents;
-        if (uv != null) mesh.uv = uv;
-        if (uv2 != null) mesh.uv2 = uv2;
-        if (colors != null) mesh.colors = colors;
-        mesh.triangles = newTriangles.ToArray();
+
+        RemapNormals(mesh, original, oldToNew, count);
+        RemapTangents(mesh, original, oldToNew, count);
+        RemapColors(mesh, original, oldToNew, count);
+        RemapAllUVChannels(mesh, original, oldToNew, count);
+
+        // Set submeshes (preserves material slot mapping)
+        mesh.subMeshCount = submeshTris.Length;
+        for (int sub = 0; sub < submeshTris.Length; sub++)
+            mesh.SetTriangles(submeshTris[sub], sub);
+
         mesh.RecalculateBounds();
         return mesh;
     }
 
+    private static void RemapNormals(
+        Mesh mesh, Mesh original, Dictionary<int, int> oldToNew, int count)
+    {
+        var src = original.normals;
+        if (src.Length != original.vertexCount) return;
+
+        var dst = new Vector3[count];
+        foreach (var kvp in oldToNew)
+            dst[kvp.Value] = src[kvp.Key];
+        mesh.normals = dst;
+    }
+
+    private static void RemapTangents(
+        Mesh mesh, Mesh original, Dictionary<int, int> oldToNew, int count)
+    {
+        var src = original.tangents;
+        if (src.Length != original.vertexCount) return;
+
+        var dst = new Vector4[count];
+        foreach (var kvp in oldToNew)
+            dst[kvp.Value] = src[kvp.Key];
+        mesh.tangents = dst;
+    }
+
+    private static void RemapColors(
+        Mesh mesh, Mesh original, Dictionary<int, int> oldToNew, int count)
+    {
+        var src = original.colors;
+        if (src.Length != original.vertexCount) return;
+
+        var dst = new Color[count];
+        foreach (var kvp in oldToNew)
+            dst[kvp.Value] = src[kvp.Key];
+        mesh.colors = dst;
+    }
+
+    /// <summary>
+    /// Remap UV channels 0-7 using GetUVs/SetUVs with Vector4 for full precision.
+    /// </summary>
+    private static void RemapAllUVChannels(
+        Mesh mesh, Mesh original, Dictionary<int, int> oldToNew, int count)
+    {
+        for (int ch = 0; ch < 8; ch++)
+        {
+            var srcUVs = new List<Vector4>();
+            original.GetUVs(ch, srcUVs);
+            if (srcUVs.Count != original.vertexCount) continue;
+
+            var dstUVs = new List<Vector4>(count);
+            for (int i = 0; i < count; i++)
+                dstUVs.Add(Vector4.zero);
+
+            foreach (var kvp in oldToNew)
+                dstUVs[kvp.Value] = srcUVs[kvp.Key];
+
+            mesh.SetUVs(ch, dstUVs);
+        }
+    }
+
     /// <summary>
     /// Save a mesh as a .asset file under Assets/Meshes/. Returns the asset path.
-    /// Handles duplicate names by appending _1, _2, etc.
     /// </summary>
     public static string SaveMeshAsset(Mesh mesh, string objectName)
     {
@@ -100,9 +166,6 @@ public static class MeshBuilder
         return path;
     }
 
-    /// <summary>
-    /// Ensure the target folder exists, creating it if necessary.
-    /// </summary>
     private static void EnsureFolderExists(string folderPath)
     {
         if (AssetDatabase.IsValidFolder(folderPath))
@@ -117,9 +180,6 @@ public static class MeshBuilder
         AssetDatabase.CreateFolder(parent, folderName);
     }
 
-    /// <summary>
-    /// Append numeric suffix until the path is unique.
-    /// </summary>
     private static string GetUniquePath(string path)
     {
         if (!File.Exists(path))
@@ -141,9 +201,6 @@ public static class MeshBuilder
         return candidate;
     }
 
-    /// <summary>
-    /// Remove characters that are invalid in file names.
-    /// </summary>
     private static string SanitizeFileName(string name)
     {
         char[] invalid = Path.GetInvalidFileNameChars();

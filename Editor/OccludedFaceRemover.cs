@@ -11,7 +11,7 @@ public class OccludedFaceRemover : EditorWindow
 {
     private int _sphereSamples = 2048;
     private int _raysPerSample = 16;
-    private int _hemisphereSamples = 32;
+    private int _hemisphereSamples = 256;
     private Dictionary<MeshFilter, HashSet<int>> _analysisResult;
     private Vector2 _scrollPos;
 
@@ -88,7 +88,7 @@ public class OccludedFaceRemover : EditorWindow
         EditorGUILayout.LabelField("Parameters", EditorStyles.boldLabel);
         _sphereSamples = EditorGUILayout.IntSlider("Sphere Samples", _sphereSamples, 512, 8192);
         _raysPerSample = EditorGUILayout.IntSlider("Rays Per Sample", _raysPerSample, 4, 32);
-        _hemisphereSamples = EditorGUILayout.IntSlider("Hemisphere Samples", _hemisphereSamples, 16, 64);
+        _hemisphereSamples = EditorGUILayout.IntSlider("Hemisphere Samples", _hemisphereSamples, 64, 512);
     }
 
     /// <summary>
