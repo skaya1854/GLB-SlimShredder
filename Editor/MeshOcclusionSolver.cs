@@ -9,29 +9,43 @@ using System.Linq;
 /// and adjacency expansion for robust occluded face detection.
 ///
 /// Phase 0: GPU rendering from multiple viewpoints (GpuVisibilitySolver)
-/// Phase 1: Multi-hit sphere raycasting (4 hits per ray for penetration)
+/// Phase 1: Supplementary sphere raycasting (backface-filtered, lightweight)
 /// Phase 2: Adjacency expansion (N-ring neighbor preservation)
 /// </summary>
 public static class MeshOcclusionSolver
 {
     private const int TempLayer = 31;
     private static readonly int TempLayerMask = 1 << TempLayer;
-    private const int BatchSize = 16384;
-    private const int MaxHitsPerRay = 4;
+    private const int BatchSize = 32768;
+    private const int MaxHitsPerRay = 2;
+    private const int RaySphereSamples = 256;
+    private const int RayJitterCount = 4;
 
     public static Dictionary<MeshFilter, HashSet<int>> SolveVisibility(
-        MeshFilter[] meshes, int sphereSamples, int raysPerSample,
-        int adjacencyDepth = 1)
+        MeshFilter[] meshes, int adjacencyDepth = 1)
     {
         var result = new Dictionary<MeshFilter, HashSet<int>>();
         foreach (var mf in meshes)
             result[mf] = new HashSet<int>();
 
+        int totalTris = 0;
+        foreach (var mf in meshes)
+        {
+            if (mf.sharedMesh == null) continue;
+            var mesh = mf.sharedMesh;
+            uint idx = 0;
+            for (int s = 0; s < mesh.subMeshCount; s++)
+                idx += mesh.GetIndexCount(s);
+            totalTris += (int)(idx / 3);
+        }
+        Debug.Log($"[OcclusionSolver] === Start: {meshes.Length} meshes, "
+                + $"{totalTris:N0} total triangles ===");
+
         // Phase 0: GPU rendering (main detection — most accurate)
         GpuVisibilitySolver.SolveVisibility(meshes, 128, 1024, result);
         LogPhaseResult("Phase 0 (GPU)", meshes, result);
 
-        // Phase 1: Multi-hit sphere raycasting (supplementary)
+        // Phase 1: Lightweight sphere raycasting (supplementary, backface-filtered)
         var colliderToMesh = new Dictionary<Collider, MeshFilter>();
         var addedColliders = new List<MeshCollider>();
         var disabledColliders = new List<Collider>();
@@ -45,10 +59,10 @@ public static class MeshOcclusionSolver
 
             var (center, radius) = ComputeBoundingSphere(meshes);
             float maxDist = radius * 4f;
-            var spherePoints = GenerateFibonacciSphere(sphereSamples);
+            var spherePoints = GenerateFibonacciSphere(RaySphereSamples);
 
             SphereRaycastBatched(spherePoints, center, radius,
-                raysPerSample, maxDist, colliderToMesh, result);
+                RayJitterCount, maxDist, colliderToMesh, result);
             LogPhaseResult("Phase 1 (Raycast)", meshes, result);
         }
         finally
@@ -99,9 +113,10 @@ public static class MeshOcclusionSolver
                 FillRaycastCommands(commands, rayData, offset, count,
                     maxDist, queryParams);
                 var handle = RaycastCommand.ScheduleBatch(
-                    commands, hits, 64, MaxHitsPerRay);
+                    commands, hits, 256, MaxHitsPerRay);
                 handle.Complete();
-                RecordMultiHits(hits, count, colliderToMesh, result);
+                RecordMultiHits(hits, count, rayData, offset,
+                    colliderToMesh, result);
             }
             finally
             {
@@ -110,8 +125,9 @@ public static class MeshOcclusionSolver
             }
 
             float progress = 0.3f + 0.4f * (offset + count) / (float)totalRays;
-            if (EditorUtility.DisplayCancelableProgressBar("Occlusion Analysis",
-                $"Phase 1: Multi-hit Raycasting ({offset + count}/{totalRays})",
+            if (EditorUtility.DisplayCancelableProgressBar("Raycast Supplement",
+                $"Rays: {offset + count:N0}/{totalRays:N0} | "
+                + $"Batch {(offset / BatchSize) + 1}",
                 progress))
                 break;
         }
@@ -152,97 +168,130 @@ public static class MeshOcclusionSolver
     // ────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Expand visible set by marking N-ring neighbors of visible triangles.
-    /// Prevents holes at the boundary between visible and removed faces.
+    /// Expand visible set by marking N-ring edge-adjacent neighbors.
+    /// Uses sorted edge array + bool[] for O(E log E) with zero GC pressure.
     /// </summary>
     private static void ExpandAdjacency(
         MeshFilter[] meshes,
         Dictionary<MeshFilter, HashSet<int>> result,
         int depth)
     {
-        foreach (var mf in meshes)
+        int totalAdded = 0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        for (int m = 0; m < meshes.Length; m++)
         {
+            var mf = meshes[m];
             var mesh = mf.sharedMesh;
             if (mesh == null) continue;
+
+            var visibleSet = result[mf];
+            if (visibleSet.Count == 0) continue;
 
             var tris = mesh.triangles;
             int triCount = tris.Length / 3;
 
-            // Build edge-to-triangle adjacency map
-            var edgeToTris = new Dictionary<long, List<int>>(triCount * 3);
+            if (EditorUtility.DisplayCancelableProgressBar(
+                "Adjacency Expansion",
+                $"Mesh {m + 1}/{meshes.Length}: {mf.gameObject.name} "
+                + $"({visibleSet.Count:N0} visible, {triCount:N0} total)",
+                0.7f + 0.3f * m / meshes.Length))
+                break;
+
+            // Build sorted edge array: (edgeKey, triIdx) — no Dictionary/List allocs
+            int edgeCount = triCount * 3;
+            var edges = new long[edgeCount];
+            var edgeTris = new int[edgeCount];
+
             for (int t = 0; t < triCount; t++)
             {
-                int a = tris[t * 3];
-                int b = tris[t * 3 + 1];
-                int c = tris[t * 3 + 2];
-                AddEdge(edgeToTris, a, b, t);
-                AddEdge(edgeToTris, b, c, t);
-                AddEdge(edgeToTris, a, c, t);
+                int a = tris[t * 3], b = tris[t * 3 + 1], c = tris[t * 3 + 2];
+                int ei = t * 3;
+                edges[ei]     = EdgeKey(a, b);
+                edges[ei + 1] = EdgeKey(b, c);
+                edges[ei + 2] = EdgeKey(a, c);
+                edgeTris[ei] = edgeTris[ei + 1] = edgeTris[ei + 2] = t;
             }
+
+            // Sort both arrays by edge key
+            System.Array.Sort(edges, edgeTris);
+
+            // bool[] for O(1) visibility lookup
+            var isVisible = new bool[triCount];
+            foreach (int t in visibleSet)
+                isVisible[t] = true;
+
+            int beforeCount = visibleSet.Count;
 
             // Expand by depth rings
-            int beforeCount = result[mf].Count;
-            var frontier = new HashSet<int>(result[mf]);
-
             for (int d = 0; d < depth; d++)
             {
-                var nextFrontier = new HashSet<int>();
-                foreach (int t in frontier)
-                {
-                    int a = tris[t * 3];
-                    int b = tris[t * 3 + 1];
-                    int c = tris[t * 3 + 2];
+                int added = 0;
 
-                    AddNeighbors(edgeToTris, a, b, t, result[mf], nextFrontier);
-                    AddNeighbors(edgeToTris, b, c, t, result[mf], nextFrontier);
-                    AddNeighbors(edgeToTris, a, c, t, result[mf], nextFrontier);
+                // Scan sorted edges: adjacent entries with same key share an edge
+                int i = 0;
+                while (i < edgeCount)
+                {
+                    long curKey = edges[i];
+                    int start = i;
+                    while (i < edgeCount && edges[i] == curKey)
+                        i++;
+                    // [start..i) share the same edge
+
+                    // Check if any triangle in this edge group is visible
+                    bool anyVisible = false;
+                    for (int j = start; j < i; j++)
+                    {
+                        if (isVisible[edgeTris[j]])
+                        {
+                            anyVisible = true;
+                            break;
+                        }
+                    }
+
+                    if (!anyVisible) continue;
+
+                    // Mark all non-visible neighbors as visible
+                    for (int j = start; j < i; j++)
+                    {
+                        int tri = edgeTris[j];
+                        if (!isVisible[tri])
+                        {
+                            isVisible[tri] = true;
+                            added++;
+                        }
+                    }
                 }
 
-                if (nextFrontier.Count == 0) break;
-
-                foreach (int t in nextFrontier)
-                    result[mf].Add(t);
-                frontier = nextFrontier;
+                if (added == 0) break;
             }
 
-            int added = result[mf].Count - beforeCount;
-            if (added > 0)
+            // Sync back to HashSet
+            for (int t = 0; t < triCount; t++)
+            {
+                if (isVisible[t])
+                    visibleSet.Add(t);
+            }
+
+            int totalAddedForMesh = visibleSet.Count - beforeCount;
+            if (totalAddedForMesh > 0)
+            {
                 Debug.Log($"[OcclusionSolver] Adjacency: {mf.gameObject.name} "
-                        + $"+{added} triangles (depth {depth})");
+                        + $"+{totalAddedForMesh} triangles (depth {depth})");
+                totalAdded += totalAddedForMesh;
+            }
         }
+
+        sw.Stop();
+        Debug.Log($"[OcclusionSolver] Adjacency done in {sw.Elapsed.TotalSeconds:F2}s, "
+                + $"+{totalAdded} triangles");
     }
 
-    private static void AddEdge(
-        Dictionary<long, List<int>> edgeToTris, int v0, int v1, int tri)
+    private static long EdgeKey(int v0, int v1)
     {
-        long key = v0 < v1
+        return v0 < v1
             ? ((long)v0 << 32) | (uint)v1
             : ((long)v1 << 32) | (uint)v0;
-
-        if (!edgeToTris.TryGetValue(key, out var list))
-        {
-            list = new List<int>(2);
-            edgeToTris[key] = list;
-        }
-        list.Add(tri);
-    }
-
-    private static void AddNeighbors(
-        Dictionary<long, List<int>> edgeToTris,
-        int v0, int v1, int self,
-        HashSet<int> existingVisible, HashSet<int> frontier)
-    {
-        long key = v0 < v1
-            ? ((long)v0 << 32) | (uint)v1
-            : ((long)v1 << 32) | (uint)v0;
-
-        if (!edgeToTris.TryGetValue(key, out var list)) return;
-
-        foreach (int neighbor in list)
-        {
-            if (neighbor != self && !existingVisible.Contains(neighbor))
-                frontier.Add(neighbor);
-        }
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -262,21 +311,25 @@ public static class MeshOcclusionSolver
     }
 
     /// <summary>
-    /// Record all hits from multi-hit raycasting.
-    /// Each ray can penetrate and hit up to MaxHitsPerRay surfaces.
+    /// Record front-face hits only (backface-filtered).
+    /// Skips hits where ray enters from behind the surface.
     /// </summary>
     private static void RecordMultiHits(
         NativeArray<RaycastHit> hits, int rayCount,
+        (Vector3 origin, Vector3 dir)[] rayData, int rayOffset,
         Dictionary<Collider, MeshFilter> colliderToMesh,
         Dictionary<MeshFilter, HashSet<int>> result)
     {
         for (int i = 0; i < rayCount; i++)
         {
+            var rayDir = rayData[rayOffset + i].dir;
             for (int h = 0; h < MaxHitsPerRay; h++)
             {
                 var hit = hits[i * MaxHitsPerRay + h];
                 if (hit.collider == null) break;
                 if (hit.triangleIndex < 0) continue;
+                // Backface filter: dot > 0 means ray hit the back side
+                if (Vector3.Dot(rayDir, hit.normal) > 0f) continue;
                 if (!colliderToMesh.TryGetValue(hit.collider, out MeshFilter mf))
                     continue;
                 result[mf].Add(hit.triangleIndex);

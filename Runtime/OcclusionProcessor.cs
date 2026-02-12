@@ -17,13 +17,7 @@ namespace SlimShredder
     /// </summary>
     public class OcclusionProcessor : MonoBehaviour
     {
-        [Header("Raycast Settings")]
-        [SerializeField, Range(512, 8192)]
-        private int _sphereSamples = 2048;
-
-        [SerializeField, Range(4, 32)]
-        private int _raysPerSample = 16;
-
+        [Header("Settings")]
         [SerializeField, Range(0, 3)]
         private int _adjacencyDepth = 1;
 
@@ -57,8 +51,7 @@ namespace SlimShredder
 
             // Analyze visibility
             var visibilityMap = MeshOcclusionSolver.SolveVisibility(
-                meshFilters, _sphereSamples, _raysPerSample,
-                _adjacencyDepth, ReportProgress);
+                meshFilters, _adjacencyDepth, ReportProgress);
 
             // Apply results
             var result = ApplyResults(meshFilters, visibilityMap);
@@ -88,8 +81,7 @@ namespace SlimShredder
 
             // Phase 1+2: Raycast + Adjacency (synchronous)
             var fullResult = MeshOcclusionSolver.SolveVisibility(
-                meshFilters, _sphereSamples, _raysPerSample,
-                _adjacencyDepth, ReportProgress);
+                meshFilters, _adjacencyDepth, ReportProgress);
             yield return null;
 
             // Merge GPU results into full result

@@ -67,7 +67,15 @@ public static class GpuVisibilitySolver
 
         try
         {
+            int totalTris = globalOffset;
             int totalVisible = 0;
+            int meshCount = idMeshes.Count;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            Debug.Log($"[GpuVisibility] Start: {meshCount} meshes, "
+                    + $"{totalTris:N0} triangles, "
+                    + $"{viewpoints.Length} viewpoints @ {resolution}x{resolution}");
+
             for (int v = 0; v < viewpoints.Length; v++)
             {
                 camGo.transform.position = center + viewpoints[v] * radius;
@@ -92,16 +100,26 @@ public static class GpuVisibilitySolver
                 int found = DecodePixels(tex, meshMapping, result);
                 totalVisible += found;
 
+                int cumVisible = result.Values.Sum(s => s.Count);
+                float visPct = totalTris > 0
+                    ? (float)cumVisible / totalTris * 100f : 0f;
+
                 if (EditorUtility.DisplayCancelableProgressBar(
                     "GPU Visibility",
-                    $"Viewpoint {v + 1}/{viewpoints.Length} "
-                    + $"(found {totalVisible} triangles)",
+                    $"Viewpoint {v + 1}/{viewpoints.Length} | "
+                    + $"Visible: {cumVisible:N0}/{totalTris:N0} ({visPct:F1}%) | "
+                    + $"+{found} new | {sw.Elapsed.TotalSeconds:F1}s",
                     (float)(v + 1) / viewpoints.Length * 0.3f))
                     break;
             }
 
-            Debug.Log($"[GpuVisibility] {viewpoints.Length} viewpoints, "
-                    + $"{resolution}x{resolution}, detected {totalVisible} unique triangles");
+            sw.Stop();
+            int finalVisible = result.Values.Sum(s => s.Count);
+            float finalPct = totalTris > 0
+                ? (float)finalVisible / totalTris * 100f : 0f;
+
+            Debug.Log($"[GpuVisibility] Done in {sw.Elapsed.TotalSeconds:F1}s: "
+                    + $"{finalVisible:N0}/{totalTris:N0} visible ({finalPct:F1}%)");
         }
         finally
         {
