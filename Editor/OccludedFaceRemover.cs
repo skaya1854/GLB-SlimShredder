@@ -38,10 +38,9 @@ public class OccludedFaceRemover : EditorWindow
         DrawParameterSection();
         EditorGUILayout.Space(10);
         DrawAnalyzeButton();
+        DrawExecuteButton();
         EditorGUILayout.Space(10);
         DrawAnalysisResult();
-        EditorGUILayout.Space(10);
-        DrawExecuteButton();
 
         EditorGUILayout.EndScrollView();
     }
