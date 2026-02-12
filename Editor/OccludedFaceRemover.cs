@@ -9,8 +9,9 @@ using System.Linq;
 /// </summary>
 public class OccludedFaceRemover : EditorWindow
 {
-    private int _sphereSamples = 1024;
-    private int _raysPerSample = 8;
+    private int _sphereSamples = 2048;
+    private int _raysPerSample = 16;
+    private int _hemisphereSamples = 32;
     private Dictionary<MeshFilter, HashSet<int>> _analysisResult;
     private Vector2 _scrollPos;
 
@@ -85,8 +86,9 @@ public class OccludedFaceRemover : EditorWindow
     private void DrawParameterSection()
     {
         EditorGUILayout.LabelField("Parameters", EditorStyles.boldLabel);
-        _sphereSamples = EditorGUILayout.IntSlider("Sphere Samples", _sphereSamples, 512, 4096);
+        _sphereSamples = EditorGUILayout.IntSlider("Sphere Samples", _sphereSamples, 512, 8192);
         _raysPerSample = EditorGUILayout.IntSlider("Rays Per Sample", _raysPerSample, 4, 32);
+        _hemisphereSamples = EditorGUILayout.IntSlider("Hemisphere Samples", _hemisphereSamples, 16, 64);
     }
 
     /// <summary>
@@ -100,7 +102,7 @@ public class OccludedFaceRemover : EditorWindow
         if (GUILayout.Button("Analyze", GUILayout.Height(30)))
         {
             _analysisResult = MeshOcclusionSolver.SolveVisibility(
-                meshFilters, _sphereSamples, _raysPerSample);
+                meshFilters, _sphereSamples, _raysPerSample, _hemisphereSamples);
         }
 
         EditorGUI.EndDisabledGroup();
