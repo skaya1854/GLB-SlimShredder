@@ -63,6 +63,10 @@ public static class MeshOcclusionSolver
             LogPhaseResult("Phase 2 (Adjacency)", meshes, result);
         }
 
+        // Phase 3: Remove small disconnected fragments (conservative)
+        RemoveSmallFragments(meshes, result);
+        LogPhaseResult("Phase 3 (Fragments)", meshes, result);
+
         EditorUtility.ClearProgressBar();
         return result;
     }
@@ -242,6 +246,131 @@ public static class MeshOcclusionSolver
         {
             if (neighbor != self && !existingVisible.Contains(neighbor))
                 frontier.Add(neighbor);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Phase 3: Small Fragment Removal (Connected Component Filtering)
+    // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Remove small disconnected triangle groups.
+    /// Never touches the largest connected component — shape is preserved.
+    /// </summary>
+    private static void RemoveSmallFragments(
+        MeshFilter[] meshes,
+        Dictionary<MeshFilter, HashSet<int>> result)
+    {
+        int totalRemoved = 0;
+
+        foreach (var mf in meshes)
+        {
+            var mesh = mf.sharedMesh;
+            if (mesh == null) continue;
+            var visibleSet = result[mf];
+            if (visibleSet.Count < 2) continue;
+
+            var tris = mesh.triangles;
+
+            // Build adjacency among visible triangles only
+            var edgeToTris = new Dictionary<long, List<int>>();
+            foreach (int triIdx in visibleSet)
+            {
+                int a = tris[triIdx * 3];
+                int b = tris[triIdx * 3 + 1];
+                int c = tris[triIdx * 3 + 2];
+                AddEdge(edgeToTris, a, b, triIdx);
+                AddEdge(edgeToTris, b, c, triIdx);
+                AddEdge(edgeToTris, a, c, triIdx);
+            }
+
+            // BFS to find connected components
+            var visited = new HashSet<int>();
+            var components = new List<HashSet<int>>();
+
+            foreach (int triIdx in visibleSet)
+            {
+                if (visited.Contains(triIdx)) continue;
+
+                var component = new HashSet<int>();
+                var queue = new Queue<int>();
+                queue.Enqueue(triIdx);
+                visited.Add(triIdx);
+
+                while (queue.Count > 0)
+                {
+                    int current = queue.Dequeue();
+                    component.Add(current);
+
+                    int a = tris[current * 3];
+                    int b = tris[current * 3 + 1];
+                    int c = tris[current * 3 + 2];
+
+                    EnqueueNeighbors(edgeToTris, a, b, current, visited, queue);
+                    EnqueueNeighbors(edgeToTris, b, c, current, visited, queue);
+                    EnqueueNeighbors(edgeToTris, a, c, current, visited, queue);
+                }
+
+                components.Add(component);
+            }
+
+            if (components.Count <= 1) continue;
+
+            // Find the largest component — never remove it
+            int maxIdx = 0;
+            for (int i = 1; i < components.Count; i++)
+            {
+                if (components[i].Count > components[maxIdx].Count)
+                    maxIdx = i;
+            }
+
+            // Conservative threshold: only remove very small groups
+            int minSize = Mathf.Max(5, visibleSet.Count / 100);
+
+            int removed = 0;
+            for (int i = 0; i < components.Count; i++)
+            {
+                if (i == maxIdx) continue; // never touch largest
+                if (components[i].Count < minSize)
+                {
+                    foreach (int triIdx in components[i])
+                        visibleSet.Remove(triIdx);
+                    removed += components[i].Count;
+                }
+            }
+
+            if (removed > 0)
+            {
+                Debug.Log($"[OcclusionSolver] Fragments: {mf.gameObject.name} "
+                        + $"removed {removed} tris in small groups "
+                        + $"(threshold: {minSize}, kept largest: {components[maxIdx].Count})");
+                totalRemoved += removed;
+            }
+        }
+
+        if (totalRemoved > 0)
+            Debug.Log($"[OcclusionSolver] Fragment removal: "
+                    + $"{totalRemoved} total triangles removed");
+    }
+
+    private static void EnqueueNeighbors(
+        Dictionary<long, List<int>> edgeToTris,
+        int v0, int v1, int self,
+        HashSet<int> visited, Queue<int> queue)
+    {
+        long key = v0 < v1
+            ? ((long)v0 << 32) | (uint)v1
+            : ((long)v1 << 32) | (uint)v0;
+
+        if (!edgeToTris.TryGetValue(key, out var list)) return;
+
+        foreach (int neighbor in list)
+        {
+            if (neighbor != self && !visited.Contains(neighbor))
+            {
+                visited.Add(neighbor);
+                queue.Enqueue(neighbor);
+            }
         }
     }
 
