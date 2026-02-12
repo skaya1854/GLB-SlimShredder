@@ -1,7 +1,9 @@
 # GLB-SlimShredder
 
-Unity Editor tool that removes occluded (hidden) mesh faces from 3D models.
+Unity tool that removes occluded (hidden) mesh faces from 3D models.
 Combines **GPU rendering**, **multi-hit raycasting**, and **adjacency expansion** to accurately detect visible geometry — then rebuilds meshes with only the surviving triangles.
+
+Supports both **Editor** (EditorWindow UI) and **Runtime** (MonoBehaviour API).
 
 ## Features
 
@@ -10,25 +12,86 @@ Combines **GPU rendering**, **multi-hit raycasting**, and **adjacency expansion*
   - Phase 1: Multi-hit sphere raycasting (4 penetration hits per ray)
   - Phase 2: N-ring adjacency expansion (boundary hole prevention)
 - **Auto Deactivation**: Fully occluded objects (0 visible faces) are automatically deactivated
-- **EditorWindow UI**: Configurable parameters with analyze/preview before execution
-- **Undo Support**: Full undo/redo via Unity's Undo system
-- **Asset Export**: Saves cleaned meshes as `.asset` files — originals remain untouched
+- **Editor Mode**: EditorWindow with analyze/preview, undo support, asset export
+- **Runtime Mode**: MonoBehaviour with sync/coroutine API, progress callback
 
 ## Installation
 
-Copy the `Editor/` folder into your Unity project's `Assets/Scripts/Editor/` (or any `Editor/` folder).
+```
+Editor only:  Copy Editor/ → Assets/Scripts/Editor/
+Runtime:      Copy Runtime/ → Assets/Scripts/ (any non-Editor folder)
+Both:         Copy both folders
+```
 
-## Usage
+---
 
-1. Select GameObjects with MeshFilter components in the Hierarchy
-2. Open **Tools > Remove Occluded Faces** from the menu bar
+## Editor Usage
+
+1. Select GameObjects with MeshFilter components
+2. Open **Tools > Remove Occluded Faces**
 3. Adjust parameters:
    - **Sphere Samples** (512–8192): Raycast viewpoints on bounding sphere
    - **Rays Per Sample** (4–32): Jittered rays per viewpoint
    - **Adjacency Depth** (0–3): N-ring neighbor preservation depth
 4. Click **Analyze** to preview results
-5. Review per-mesh breakdown (total / visible / removed triangles)
-6. Click **Execute Removal** to apply
+5. Click **Execute Removal** to apply (with Undo support)
+
+---
+
+## Runtime Usage
+
+All runtime classes are in the `SlimShredder` namespace.
+
+### Quick Start (Synchronous)
+
+```csharp
+using SlimShredder;
+
+var processor = gameObject.AddComponent<OcclusionProcessor>();
+OcclusionResult result = processor.Process(targetGameObject);
+
+Debug.Log($"Removed {result.TrianglesRemoved} triangles, "
+        + $"deactivated {result.DeactivatedObjects} objects");
+```
+
+### Coroutine (Non-blocking)
+
+```csharp
+using SlimShredder;
+
+var processor = gameObject.AddComponent<OcclusionProcessor>();
+processor.OnProgress += (progress, desc) => loadingBar.value = progress;
+
+StartCoroutine(processor.ProcessAsync(targetGameObject, result =>
+{
+    Debug.Log($"Done: {result.TrianglesRemoved} triangles removed");
+}));
+```
+
+### Direct API (Advanced)
+
+```csharp
+using SlimShredder;
+
+MeshFilter[] meshes = target.GetComponentsInChildren<MeshFilter>();
+
+// Step 1: Analyze
+var visibilityMap = MeshOcclusionSolver.SolveVisibility(
+    meshes, sphereSamples: 2048, raysPerSample: 16, adjacencyDepth: 1);
+
+// Step 2: Rebuild individually
+foreach (var (mf, visibleSet) in visibilityMap)
+{
+    if (visibleSet.Count == 0) { mf.gameObject.SetActive(false); continue; }
+    mf.sharedMesh = MeshBuilder.BuildCleanMesh(mf.sharedMesh, visibleSet);
+}
+```
+
+### Runtime Setup
+
+Add `Hidden/Internal-Colored` to **Project Settings > Graphics > Always Included Shaders** for GPU visibility to work in builds.
+
+---
 
 ## Algorithm
 
@@ -52,26 +115,30 @@ Prevents holes at the boundary between visible and removed geometry.
 
 ### Execution
 
-- Partially visible meshes → rebuilt with only visible triangles, saved as new `.asset`
-- Fully occluded meshes (0 visible) → `GameObject.SetActive(false)` (prevents empty mesh export errors)
+- Partially visible meshes → rebuilt with only visible triangles
+- Fully occluded meshes (0 visible) → `GameObject.SetActive(false)`
 
 ## Files
 
-| File | Description |
-|------|-------------|
-| `Editor/GpuVisibilitySolver.cs` | GPU-based Triangle ID rendering with CommandBuffer |
-| `Editor/MeshOcclusionSolver.cs` | 3-phase orchestrator (GPU + Raycast + Adjacency) |
-| `Editor/MeshBuilder.cs` | Mesh reconstruction, vertex remapping, and asset saving |
-| `Editor/OccludedFaceRemover.cs` | EditorWindow UI and execution logic |
+| Folder | File | Description |
+|--------|------|-------------|
+| `Editor/` | `GpuVisibilitySolver.cs` | GPU Triangle ID rendering (Editor) |
+| `Editor/` | `MeshOcclusionSolver.cs` | 3-phase orchestrator (Editor) |
+| `Editor/` | `MeshBuilder.cs` | Mesh reconstruction + asset saving (Editor) |
+| `Editor/` | `OccludedFaceRemover.cs` | EditorWindow UI |
+| `Runtime/` | `GpuVisibilitySolver.cs` | GPU Triangle ID rendering (Runtime) |
+| `Runtime/` | `MeshOcclusionSolver.cs` | 3-phase orchestrator (Runtime) |
+| `Runtime/` | `MeshBuilder.cs` | Mesh reconstruction (Runtime) |
+| `Runtime/` | `OcclusionProcessor.cs` | MonoBehaviour wrapper + OcclusionResult |
 
 ## Requirements
 
 - Unity 6+ (URP compatible)
-- Editor only (no runtime dependency)
+- Runtime: `Hidden/Internal-Colored` in Always Included Shaders
 
 ## Notes
 
-- Submesh structure and material slots are preserved on cleaned meshes
+- Submesh structure and material slots are preserved
 - All vertex attributes preserved (positions, normals, tangents, colors, UV0–UV7)
 - Uses Physics layer 31 temporarily during raycast analysis
-- GPU phase uses `Hidden/Internal-Colored` shader with float RT to avoid sRGB precision loss
+- GPU phase uses float RT to avoid sRGB precision loss
