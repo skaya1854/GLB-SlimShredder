@@ -5,25 +5,33 @@ using System.Collections.Generic;
 using System.Linq;
 
 /// <summary>
-/// Visibility solver using batched RaycastCommands.
-/// Phase 1: Sphere raycasting from bounding sphere surface.
-/// Phase 2: Escape ray — cast from each unmarked triangle outward;
-///          if no surface is hit, the triangle faces the outside → visible.
+/// Visibility solver combining GPU rendering, multi-hit raycasting,
+/// and adjacency expansion for robust occluded face detection.
+///
+/// Phase 0: GPU rendering from multiple viewpoints (GpuVisibilitySolver)
+/// Phase 1: Multi-hit sphere raycasting (4 hits per ray for penetration)
+/// Phase 2: Adjacency expansion (N-ring neighbor preservation)
 /// </summary>
 public static class MeshOcclusionSolver
 {
     private const int TempLayer = 31;
     private static readonly int TempLayerMask = 1 << TempLayer;
     private const int BatchSize = 16384;
+    private const int MaxHitsPerRay = 4;
 
     public static Dictionary<MeshFilter, HashSet<int>> SolveVisibility(
         MeshFilter[] meshes, int sphereSamples, int raysPerSample,
-        int hemisphereSamples = 256)
+        int adjacencyDepth = 1)
     {
         var result = new Dictionary<MeshFilter, HashSet<int>>();
         foreach (var mf in meshes)
             result[mf] = new HashSet<int>();
 
+        // Phase 0: GPU rendering (main detection — most accurate)
+        GpuVisibilitySolver.SolveVisibility(meshes, 128, 1024, result);
+        LogPhaseResult("Phase 0 (GPU)", meshes, result);
+
+        // Phase 1: Multi-hit sphere raycasting (supplementary)
         var colliderToMesh = new Dictionary<Collider, MeshFilter>();
         var addedColliders = new List<MeshCollider>();
         var disabledColliders = new List<Collider>();
@@ -39,26 +47,28 @@ public static class MeshOcclusionSolver
             float maxDist = radius * 4f;
             var spherePoints = GenerateFibonacciSphere(sphereSamples);
 
-            // Phase 1: Sphere raycasting from bounding sphere surface
             SphereRaycastBatched(spherePoints, center, radius,
                 raysPerSample, maxDist, colliderToMesh, result);
-            LogPhaseResult("Phase 1", meshes, result);
-
-            // Phase 2: Escape ray — cast outward from unmarked triangles
-            EscapeRayBatched(meshes, result, hemisphereSamples, maxDist);
-            LogPhaseResult("Phase 2", meshes, result);
+            LogPhaseResult("Phase 1 (Raycast)", meshes, result);
         }
         finally
         {
             CleanupColliders(addedColliders, disabledColliders, originalLayers);
-            EditorUtility.ClearProgressBar();
         }
 
+        // Phase 2: Adjacency expansion (safety net)
+        if (adjacencyDepth > 0)
+        {
+            ExpandAdjacency(meshes, result, adjacencyDepth);
+            LogPhaseResult("Phase 2 (Adjacency)", meshes, result);
+        }
+
+        EditorUtility.ClearProgressBar();
         return result;
     }
 
     // ────────────────────────────────────────────────────────────────
-    // Phase 1: Sphere Raycasting
+    // Phase 1: Multi-hit Sphere Raycasting
     // ────────────────────────────────────────────────────────────────
 
     private static void SphereRaycastBatched(
@@ -79,16 +89,19 @@ public static class MeshOcclusionSolver
         for (int offset = 0; offset < totalRays; offset += BatchSize)
         {
             int count = Mathf.Min(BatchSize, totalRays - offset);
-            var commands = new NativeArray<RaycastCommand>(count, Allocator.TempJob);
-            var hits = new NativeArray<RaycastHit>(count, Allocator.TempJob);
+            var commands = new NativeArray<RaycastCommand>(
+                count, Allocator.TempJob);
+            var hits = new NativeArray<RaycastHit>(
+                count * MaxHitsPerRay, Allocator.TempJob);
 
             try
             {
                 FillRaycastCommands(commands, rayData, offset, count,
                     maxDist, queryParams);
-                var handle = RaycastCommand.ScheduleBatch(commands, hits, 64);
+                var handle = RaycastCommand.ScheduleBatch(
+                    commands, hits, 64, MaxHitsPerRay);
                 handle.Complete();
-                RecordPhase1Hits(hits, count, colliderToMesh, result);
+                RecordMultiHits(hits, count, colliderToMesh, result);
             }
             finally
             {
@@ -96,9 +109,9 @@ public static class MeshOcclusionSolver
                 hits.Dispose();
             }
 
-            float progress = 0.5f * (offset + count) / (float)totalRays;
+            float progress = 0.3f + 0.4f * (offset + count) / (float)totalRays;
             if (EditorUtility.DisplayCancelableProgressBar("Occlusion Analysis",
-                $"Phase 1: Sphere Raycasting ({offset + count}/{totalRays})",
+                $"Phase 1: Multi-hit Raycasting ({offset + count}/{totalRays})",
                 progress))
                 break;
         }
@@ -125,124 +138,110 @@ public static class MeshOcclusionSolver
             for (int j = 0; j < raysPerSample; j++)
             {
                 float angle = goldenAngle * j;
-                // Wider spread (0.5) to cover more of the object's angular extent
                 float spread = 0.5f * (j + 1f) / raysPerSample;
                 Vector3 jitter = tangent * (Mathf.Cos(angle) * spread)
                                + bitangent * (Mathf.Sin(angle) * spread);
-                rayData[baseIdx + 1 + j] = (origin, (mainDir + jitter).normalized);
+                rayData[baseIdx + 1 + j] =
+                    (origin, (mainDir + jitter).normalized);
             }
         }
     }
 
     // ────────────────────────────────────────────────────────────────
-    // Phase 2: Escape Ray
+    // Phase 2: Adjacency Expansion
     // ────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// For each unmarked triangle, cast rays outward from its center
-    /// along the normal hemisphere. If ANY ray escapes without hitting
-    /// a surface, the triangle is visible from outside.
+    /// Expand visible set by marking N-ring neighbors of visible triangles.
+    /// Prevents holes at the boundary between visible and removed faces.
     /// </summary>
-    private static void EscapeRayBatched(
+    private static void ExpandAdjacency(
         MeshFilter[] meshes,
         Dictionary<MeshFilter, HashSet<int>> result,
-        int hemisphereSamples, float maxDist)
+        int depth)
     {
-        var unmarked = CollectUnmarkedTriangles(meshes, result);
-        if (unmarked.Count == 0) return;
-
-        var hemisphereDirs = GenerateFibonacciHemisphere(hemisphereSamples);
-        int raysPerTri = hemisphereDirs.Length;
-        int totalRays = unmarked.Count * raysPerTri;
-
-        Debug.Log($"[OcclusionSolver] Phase 2 (Escape Ray): {unmarked.Count} "
-                + $"triangles × {raysPerTri} dirs = {totalRays} rays");
-
-        var queryParams = new QueryParameters(TempLayerMask, false,
-            QueryTriggerInteraction.Ignore, false);
-        var visibleIndices = new HashSet<int>();
-
-        for (int rayOffset = 0; rayOffset < totalRays; rayOffset += BatchSize)
+        foreach (var mf in meshes)
         {
-            int count = Mathf.Min(BatchSize, totalRays - rayOffset);
-            var commands = new NativeArray<RaycastCommand>(count, Allocator.TempJob);
-            var hits = new NativeArray<RaycastHit>(count, Allocator.TempJob);
+            var mesh = mf.sharedMesh;
+            if (mesh == null) continue;
 
-            try
+            var tris = mesh.triangles;
+            int triCount = tris.Length / 3;
+
+            // Build edge-to-triangle adjacency map
+            var edgeToTris = new Dictionary<long, List<int>>(triCount * 3);
+            for (int t = 0; t < triCount; t++)
             {
-                FillEscapeRayCommands(commands, count, unmarked,
-                    hemisphereDirs, raysPerTri, rayOffset, maxDist, queryParams);
+                int a = tris[t * 3];
+                int b = tris[t * 3 + 1];
+                int c = tris[t * 3 + 2];
+                AddEdge(edgeToTris, a, b, t);
+                AddEdge(edgeToTris, b, c, t);
+                AddEdge(edgeToTris, a, c, t);
+            }
 
-                var handle = RaycastCommand.ScheduleBatch(commands, hits, 64);
-                handle.Complete();
+            // Expand by depth rings
+            int beforeCount = result[mf].Count;
+            var frontier = new HashSet<int>(result[mf]);
 
-                // If ray hits NOTHING → triangle can see outside → visible
-                for (int i = 0; i < count; i++)
+            for (int d = 0; d < depth; d++)
+            {
+                var nextFrontier = new HashSet<int>();
+                foreach (int t in frontier)
                 {
-                    int triLocal = (rayOffset + i) / raysPerTri;
-                    if (visibleIndices.Contains(triLocal)) continue;
-                    if (hits[i].collider == null)
-                        visibleIndices.Add(triLocal);
+                    int a = tris[t * 3];
+                    int b = tris[t * 3 + 1];
+                    int c = tris[t * 3 + 2];
+
+                    AddNeighbors(edgeToTris, a, b, t, result[mf], nextFrontier);
+                    AddNeighbors(edgeToTris, b, c, t, result[mf], nextFrontier);
+                    AddNeighbors(edgeToTris, a, c, t, result[mf], nextFrontier);
                 }
+
+                if (nextFrontier.Count == 0) break;
+
+                foreach (int t in nextFrontier)
+                    result[mf].Add(t);
+                frontier = nextFrontier;
             }
-            finally
-            {
-                commands.Dispose();
-                hits.Dispose();
-            }
 
-            float progress = 0.5f + 0.5f * (rayOffset + count) / (float)totalRays;
-            if (EditorUtility.DisplayCancelableProgressBar("Occlusion Analysis",
-                $"Phase 2: Escape Ray ({rayOffset + count}/{totalRays})",
-                progress))
-                break;
+            int added = result[mf].Count - beforeCount;
+            if (added > 0)
+                Debug.Log($"[OcclusionSolver] Adjacency: {mf.gameObject.name} "
+                        + $"+{added} triangles (depth {depth})");
         }
-
-        int recovered = visibleIndices.Count;
-        foreach (int idx in visibleIndices)
-        {
-            var (mf, triIdx, _, _, _) = unmarked[idx];
-            result[mf].Add(triIdx);
-        }
-
-        Debug.Log($"[OcclusionSolver] Phase 2 recovered "
-                + $"{recovered}/{unmarked.Count} triangles");
     }
 
-    private static void FillEscapeRayCommands(
-        NativeArray<RaycastCommand> commands, int count,
-        List<(MeshFilter mf, int triIdx, Vector3 center, Vector3 normal,
-              float meshRadius)> unmarked,
-        Vector3[] hemisphereDirs, int raysPerTri,
-        int rayStartOffset, float maxDist, QueryParameters queryParams)
+    private static void AddEdge(
+        Dictionary<long, List<int>> edgeToTris, int v0, int v1, int tri)
     {
-        for (int i = 0; i < count; i++)
+        long key = v0 < v1
+            ? ((long)v0 << 32) | (uint)v1
+            : ((long)v1 << 32) | (uint)v0;
+
+        if (!edgeToTris.TryGetValue(key, out var list))
         {
-            int globalRay = rayStartOffset + i;
-            int triLocal = globalRay / raysPerTri;
-            int dirIdx = globalRay % raysPerTri;
+            list = new List<int>(2);
+            edgeToTris[key] = list;
+        }
+        list.Add(tri);
+    }
 
-            var (_, _, center, normal, meshRadius) = unmarked[triLocal];
+    private static void AddNeighbors(
+        Dictionary<long, List<int>> edgeToTris,
+        int v0, int v1, int self,
+        HashSet<int> existingVisible, HashSet<int> frontier)
+    {
+        long key = v0 < v1
+            ? ((long)v0 << 32) | (uint)v1
+            : ((long)v1 << 32) | (uint)v0;
 
-            // Build tangent frame from normal
-            Vector3 up = Mathf.Abs(normal.y) < 0.999f
-                ? Vector3.up : Vector3.right;
-            Vector3 tangent = Vector3.Cross(normal, up).normalized;
-            Vector3 bitangent = Vector3.Cross(normal, tangent);
+        if (!edgeToTris.TryGetValue(key, out var list)) return;
 
-            // Transform hemisphere direction to world space
-            // localDir.y maps to the normal direction
-            Vector3 localDir = hemisphereDirs[dirIdx];
-            Vector3 worldDir = tangent * localDir.x
-                             + normal * localDir.y
-                             + bitangent * localDir.z;
-
-            // Small offset along normal to avoid self-intersection
-            float offset = Mathf.Max(meshRadius * 0.001f, 0.001f);
-            Vector3 origin = center + normal * offset;
-
-            commands[i] = new RaycastCommand(origin, worldDir,
-                queryParams, maxDist);
+        foreach (int neighbor in list)
+        {
+            if (neighbor != self && !existingVisible.Contains(neighbor))
+                frontier.Add(neighbor);
         }
     }
 
@@ -262,19 +261,26 @@ public static class MeshOcclusionSolver
         }
     }
 
-    private static void RecordPhase1Hits(
-        NativeArray<RaycastHit> hits, int count,
+    /// <summary>
+    /// Record all hits from multi-hit raycasting.
+    /// Each ray can penetrate and hit up to MaxHitsPerRay surfaces.
+    /// </summary>
+    private static void RecordMultiHits(
+        NativeArray<RaycastHit> hits, int rayCount,
         Dictionary<Collider, MeshFilter> colliderToMesh,
         Dictionary<MeshFilter, HashSet<int>> result)
     {
-        for (int i = 0; i < count; i++)
+        for (int i = 0; i < rayCount; i++)
         {
-            var hit = hits[i];
-            if (hit.collider == null) continue;
-            if (hit.triangleIndex < 0) continue;
-            if (!colliderToMesh.TryGetValue(hit.collider, out MeshFilter mf))
-                continue;
-            result[mf].Add(hit.triangleIndex);
+            for (int h = 0; h < MaxHitsPerRay; h++)
+            {
+                var hit = hits[i * MaxHitsPerRay + h];
+                if (hit.collider == null) break;
+                if (hit.triangleIndex < 0) continue;
+                if (!colliderToMesh.TryGetValue(hit.collider, out MeshFilter mf))
+                    continue;
+                result[mf].Add(hit.triangleIndex);
+            }
         }
     }
 
@@ -346,82 +352,12 @@ public static class MeshOcclusionSolver
         {
             float theta = 2f * Mathf.PI * i / goldenRatio;
             float phi = Mathf.Acos(1f - 2f * (i + 0.5f) / samples);
-
             points[i] = new Vector3(
                 Mathf.Sin(phi) * Mathf.Cos(theta),
                 Mathf.Sin(phi) * Mathf.Sin(theta),
                 Mathf.Cos(phi));
         }
         return points;
-    }
-
-    /// <summary>
-    /// Generate uniformly distributed directions on the upper hemisphere.
-    /// Uses Fibonacci spiral with cosTheta uniform in [0, 1].
-    /// In local tangent space, y maps to the triangle normal direction.
-    /// </summary>
-    private static Vector3[] GenerateFibonacciHemisphere(int samples)
-    {
-        var dirs = new Vector3[samples];
-        float goldenRatio = (1f + Mathf.Sqrt(5f)) / 2f;
-
-        for (int i = 0; i < samples; i++)
-        {
-            float phi = 2f * Mathf.PI * i / goldenRatio;
-            // cosTheta uniform in (0, 1) → uniform solid angle on hemisphere
-            float cosTheta = 1f - (i + 0.5f) / samples;
-            float sinTheta = Mathf.Sqrt(1f - cosTheta * cosTheta);
-
-            dirs[i] = new Vector3(
-                sinTheta * Mathf.Cos(phi),
-                cosTheta,
-                sinTheta * Mathf.Sin(phi));
-        }
-        return dirs;
-    }
-
-    /// <summary>
-    /// Collect unmarked triangles with per-mesh bounds radius.
-    /// </summary>
-    private static List<(MeshFilter mf, int triIdx, Vector3 center,
-        Vector3 normal, float meshRadius)>
-        CollectUnmarkedTriangles(
-            MeshFilter[] meshes,
-            Dictionary<MeshFilter, HashSet<int>> result)
-    {
-        var unmarked = new List<(MeshFilter, int, Vector3, Vector3, float)>();
-
-        foreach (var mf in meshes)
-        {
-            var mesh = mf.sharedMesh;
-            if (mesh == null) continue;
-
-            var renderer = mf.GetComponent<Renderer>();
-            float meshRadius = renderer != null
-                ? Mathf.Max(renderer.bounds.extents.magnitude, 0.1f)
-                : 1f;
-
-            var tris = mesh.triangles;
-            var verts = mesh.vertices;
-            var tf = mf.transform;
-            int triCount = tris.Length / 3;
-
-            for (int t = 0; t < triCount; t++)
-            {
-                if (result[mf].Contains(t)) continue;
-
-                Vector3 v0 = tf.TransformPoint(verts[tris[t * 3]]);
-                Vector3 v1 = tf.TransformPoint(verts[tris[t * 3 + 1]]);
-                Vector3 v2 = tf.TransformPoint(verts[tris[t * 3 + 2]]);
-
-                Vector3 cross = Vector3.Cross(v1 - v0, v2 - v0);
-                if (cross.sqrMagnitude < 1e-10f) continue;
-
-                unmarked.Add((mf, t, (v0 + v1 + v2) / 3f,
-                    cross.normalized, meshRadius));
-            }
-        }
-        return unmarked;
     }
 
     private static (Vector3 center, float radius) ComputeBoundingSphere(

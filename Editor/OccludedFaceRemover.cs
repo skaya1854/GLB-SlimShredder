@@ -5,13 +5,13 @@ using System.Linq;
 
 /// <summary>
 /// Editor window for analyzing and removing occluded (hidden) mesh faces.
-/// Uses sphere raycasting + normal raycasting to detect visibility.
+/// Uses GPU rendering + multi-hit raycasting + adjacency expansion.
 /// </summary>
 public class OccludedFaceRemover : EditorWindow
 {
     private int _sphereSamples = 2048;
     private int _raysPerSample = 16;
-    private int _hemisphereSamples = 256;
+    private int _adjacencyDepth = 1;
     private Dictionary<MeshFilter, HashSet<int>> _analysisResult;
     private Vector2 _scrollPos;
 
@@ -88,7 +88,12 @@ public class OccludedFaceRemover : EditorWindow
         EditorGUILayout.LabelField("Parameters", EditorStyles.boldLabel);
         _sphereSamples = EditorGUILayout.IntSlider("Sphere Samples", _sphereSamples, 512, 8192);
         _raysPerSample = EditorGUILayout.IntSlider("Rays Per Sample", _raysPerSample, 4, 32);
-        _hemisphereSamples = EditorGUILayout.IntSlider("Hemisphere Samples", _hemisphereSamples, 64, 512);
+        _adjacencyDepth = EditorGUILayout.IntSlider("Adjacency Depth", _adjacencyDepth, 0, 3);
+        EditorGUILayout.HelpBox(
+            "Phase 0: GPU rendering (128 viewpoints)\n"
+            + "Phase 1: Multi-hit raycasting (4 hits per ray)\n"
+            + "Phase 2: Adjacency expansion (N-ring neighbors)",
+            MessageType.None);
     }
 
     /// <summary>
@@ -102,7 +107,8 @@ public class OccludedFaceRemover : EditorWindow
         if (GUILayout.Button("Analyze", GUILayout.Height(30)))
         {
             _analysisResult = MeshOcclusionSolver.SolveVisibility(
-                meshFilters, _sphereSamples, _raysPerSample, _hemisphereSamples);
+                meshFilters, _sphereSamples, _raysPerSample,
+                adjacencyDepth: _adjacencyDepth);
         }
 
         EditorGUI.EndDisabledGroup();
