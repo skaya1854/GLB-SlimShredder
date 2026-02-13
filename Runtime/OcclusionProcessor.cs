@@ -51,7 +51,7 @@ namespace SlimShredder
 
             // Analyze visibility
             var visibilityMap = MeshOcclusionSolver.SolveVisibility(
-                meshFilters, _adjacencyDepth, ReportProgress);
+                meshFilters, _adjacencyDepth, true, 1, ReportProgress);
 
             // Apply results
             var result = ApplyResults(meshFilters, visibilityMap);
@@ -76,12 +76,12 @@ namespace SlimShredder
             foreach (var mf in meshFilters)
                 result[mf] = new HashSet<int>();
 
-            GpuVisibilitySolver.SolveVisibility(meshFilters, 128, 1024, result, ReportProgress);
+            GpuVisibilitySolver.SolveVisibility(meshFilters, 128, 1024, result, 1, ReportProgress);
             yield return null;
 
             // Phase 1+2: Raycast + Adjacency (synchronous)
             var fullResult = MeshOcclusionSolver.SolveVisibility(
-                meshFilters, _adjacencyDepth, ReportProgress);
+                meshFilters, _adjacencyDepth, true, 1, ReportProgress);
             yield return null;
 
             // Merge GPU results into full result

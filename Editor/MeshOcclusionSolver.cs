@@ -22,7 +22,8 @@ public static class MeshOcclusionSolver
     private const int RayJitterCount = 4;
 
     public static Dictionary<MeshFilter, HashSet<int>> SolveVisibility(
-        MeshFilter[] meshes, int adjacencyDepth = 1)
+        MeshFilter[] meshes, int adjacencyDepth = 1, bool enableRaycast = true,
+        int minViewpoints = 1)
     {
         var result = new Dictionary<MeshFilter, HashSet<int>>();
         foreach (var mf in meshes)
@@ -42,32 +43,39 @@ public static class MeshOcclusionSolver
                 + $"{totalTris:N0} total triangles ===");
 
         // Phase 0: GPU rendering (main detection — most accurate)
-        GpuVisibilitySolver.SolveVisibility(meshes, 128, 1024, result);
+        GpuVisibilitySolver.SolveVisibility(meshes, 128, 1024, result, minViewpoints);
         LogPhaseResult("Phase 0 (GPU)", meshes, result);
 
         // Phase 1: Lightweight sphere raycasting (supplementary, backface-filtered)
-        var colliderToMesh = new Dictionary<Collider, MeshFilter>();
-        var addedColliders = new List<MeshCollider>();
-        var disabledColliders = new List<Collider>();
-        var originalLayers = new Dictionary<GameObject, int>();
-
-        try
+        if (enableRaycast)
         {
-            SetupColliders(meshes, colliderToMesh, addedColliders,
-                disabledColliders, originalLayers);
-            Physics.SyncTransforms();
+            var colliderToMesh = new Dictionary<Collider, MeshFilter>();
+            var addedColliders = new List<MeshCollider>();
+            var disabledColliders = new List<Collider>();
+            var originalLayers = new Dictionary<GameObject, int>();
 
-            var (center, radius) = ComputeBoundingSphere(meshes);
-            float maxDist = radius * 4f;
-            var spherePoints = GenerateFibonacciSphere(RaySphereSamples);
+            try
+            {
+                SetupColliders(meshes, colliderToMesh, addedColliders,
+                    disabledColliders, originalLayers);
+                Physics.SyncTransforms();
 
-            SphereRaycastBatched(spherePoints, center, radius,
-                RayJitterCount, maxDist, colliderToMesh, result);
-            LogPhaseResult("Phase 1 (Raycast)", meshes, result);
+                var (center, radius) = ComputeBoundingSphere(meshes);
+                float maxDist = radius * 4f;
+                var spherePoints = GenerateFibonacciSphere(RaySphereSamples);
+
+                SphereRaycastBatched(spherePoints, center, radius,
+                    RayJitterCount, maxDist, colliderToMesh, result);
+                LogPhaseResult("Phase 1 (Raycast)", meshes, result);
+            }
+            finally
+            {
+                CleanupColliders(addedColliders, disabledColliders, originalLayers);
+            }
         }
-        finally
+        else
         {
-            CleanupColliders(addedColliders, disabledColliders, originalLayers);
+            Debug.Log("[OcclusionSolver] Phase 1 (Raycast): SKIPPED (disabled)");
         }
 
         // Phase 2: Adjacency expansion (safety net)

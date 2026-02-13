@@ -10,6 +10,7 @@ using System.Linq;
 public class OccludedFaceRemover : EditorWindow
 {
     private int _adjacencyDepth = 1;
+    private int _minViewpoints = 2;
     private Dictionary<MeshFilter, HashSet<int>> _analysisResult;
     private Vector2 _scrollPos;
 
@@ -78,12 +79,33 @@ public class OccludedFaceRemover : EditorWindow
     private void DrawParameterSection()
     {
         EditorGUILayout.LabelField("Parameters", EditorStyles.boldLabel);
-        _adjacencyDepth = EditorGUILayout.IntSlider("Adjacency Depth", _adjacencyDepth, 0, 3);
+
+        _minViewpoints = EditorGUILayout.IntSlider(
+            new GUIContent("Min Viewpoints",
+                "128 viewpoints out of which a triangle must be seen from at least this many. "
+                + "1 = no filtering, 2~3 = remove internal peek-throughs, 5+ = aggressive."),
+            _minViewpoints, 1, 10);
         EditorGUILayout.HelpBox(
-            "Phase 0: GPU rendering (128 viewpoints)\n"
-            + "Phase 1: Sphere raycasting (256 pts, backface-filtered)\n"
-            + "Phase 2: Adjacency expansion (N-ring neighbors)",
+            "Internal fragments visible from only 1-2 angles are filtered.\n"
+            + "Exterior faces (visible from many angles) remain safe.",
             MessageType.None);
+
+        _adjacencyDepth = EditorGUILayout.IntSlider(
+            new GUIContent("Adjacency Depth",
+                "After visibility detection, expand visible set by marking N-ring "
+                + "edge-adjacent neighbors. Prevents edge artifacts on visible boundaries."),
+            _adjacencyDepth, 0, 3);
+        EditorGUILayout.HelpBox(
+            "0 = no expansion, 1 = immediate neighbors (recommended), "
+            + "2~3 = wider safety margin.",
+            MessageType.None);
+
+        EditorGUILayout.Space(5);
+        EditorGUILayout.HelpBox(
+            $"Pipeline:\n"
+            + $"  Phase 0: GPU rendering (128 viewpoints, min votes={_minViewpoints})\n"
+            + $"  Phase 1: Adjacency expansion (depth={_adjacencyDepth})",
+            MessageType.Info);
     }
 
     /// <summary>
@@ -97,7 +119,7 @@ public class OccludedFaceRemover : EditorWindow
         if (GUILayout.Button("Analyze", GUILayout.Height(30)))
         {
             _analysisResult = MeshOcclusionSolver.SolveVisibility(
-                meshFilters, adjacencyDepth: _adjacencyDepth);
+                meshFilters, _adjacencyDepth, false, _minViewpoints);
         }
 
         EditorGUI.EndDisabledGroup();

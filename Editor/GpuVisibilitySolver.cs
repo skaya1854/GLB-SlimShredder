@@ -17,7 +17,8 @@ public static class GpuVisibilitySolver
     /// </summary>
     public static void SolveVisibility(
         MeshFilter[] meshes, int viewpointCount, int resolution,
-        Dictionary<MeshFilter, HashSet<int>> result)
+        Dictionary<MeshFilter, HashSet<int>> result,
+        int minViewpoints = 1)
     {
         // Build ID-encoded meshes and mapping
         var idMeshes = new List<(Mesh mesh, Matrix4x4 matrix)>();
@@ -72,9 +73,15 @@ public static class GpuVisibilitySolver
             int meshCount = idMeshes.Count;
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
+            // Per-triangle viewpoint vote counter (globalTriIdx -> count)
+            var viewCounts = minViewpoints > 1
+                ? new Dictionary<int, int>() : null;
+
             Debug.Log($"[GpuVisibility] Start: {meshCount} meshes, "
                     + $"{totalTris:N0} triangles, "
-                    + $"{viewpoints.Length} viewpoints @ {resolution}x{resolution}");
+                    + $"{viewpoints.Length} viewpoints @ {resolution}x{resolution}"
+                    + (minViewpoints > 1
+                        ? $", minViewpoints={minViewpoints}" : ""));
 
             for (int v = 0; v < viewpoints.Length; v++)
             {
@@ -97,8 +104,22 @@ public static class GpuVisibilitySolver
                 tex.Apply();
                 RenderTexture.active = null;
 
-                int found = DecodePixels(tex, meshMapping, result);
+                // Collect per-viewpoint unique global IDs for vote counting
+                HashSet<int> seenThisView = viewCounts != null
+                    ? new HashSet<int>() : null;
+
+                int found = DecodePixels(tex, meshMapping, result, seenThisView);
                 totalVisible += found;
+
+                // Increment vote counts for each triangle seen this viewpoint
+                if (seenThisView != null)
+                {
+                    foreach (int globalIdx in seenThisView)
+                    {
+                        viewCounts.TryGetValue(globalIdx, out int c);
+                        viewCounts[globalIdx] = c + 1;
+                    }
+                }
 
                 int cumVisible = result.Values.Sum(s => s.Count);
                 float visPct = totalTris > 0
@@ -111,6 +132,33 @@ public static class GpuVisibilitySolver
                     + $"+{found} new | {sw.Elapsed.TotalSeconds:F1}s",
                     (float)(v + 1) / viewpoints.Length * 0.3f))
                     break;
+            }
+
+            // Filter by minimum viewpoint votes
+            if (viewCounts != null)
+            {
+                int beforeFilter = result.Values.Sum(s => s.Count);
+                int removed = 0;
+
+                foreach (var (mf, triOffset, triCount) in meshMapping)
+                {
+                    var visible = result[mf];
+                    var toRemove = new List<int>();
+                    foreach (int localTri in visible)
+                    {
+                        int globalIdx = triOffset + localTri;
+                        if (!viewCounts.TryGetValue(globalIdx, out int count)
+                            || count < minViewpoints)
+                            toRemove.Add(localTri);
+                    }
+                    foreach (int tri in toRemove)
+                        visible.Remove(tri);
+                    removed += toRemove.Count;
+                }
+
+                Debug.Log($"[GpuVisibility] Voting filter (min={minViewpoints}): "
+                        + $"removed {removed:N0} low-confidence triangles "
+                        + $"({beforeFilter:N0} -> {beforeFilter - removed:N0})");
             }
 
             sw.Stop();
@@ -203,7 +251,8 @@ public static class GpuVisibilitySolver
     private static int DecodePixels(
         Texture2D tex,
         List<(MeshFilter mf, int triOffset, int triCount)> meshMapping,
-        Dictionary<MeshFilter, HashSet<int>> result)
+        Dictionary<MeshFilter, HashSet<int>> result,
+        HashSet<int> seenGlobalIds = null)
     {
         var pixels = tex.GetPixels();
         int newCount = 0;
@@ -214,6 +263,7 @@ public static class GpuVisibilitySolver
             if (globalId <= 0) continue;
 
             int triIdx = globalId - 1;
+            seenGlobalIds?.Add(triIdx);
 
             foreach (var (mf, triOffset, triCount) in meshMapping)
             {

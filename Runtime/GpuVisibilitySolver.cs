@@ -19,6 +19,7 @@ namespace SlimShredder
         public static void SolveVisibility(
             MeshFilter[] meshes, int viewpointCount, int resolution,
             Dictionary<MeshFilter, HashSet<int>> result,
+            int minViewpoints = 1,
             Action<float, string> onProgress = null)
         {
             var idMeshes = new List<(Mesh mesh, Matrix4x4 matrix)>();
@@ -69,6 +70,9 @@ namespace SlimShredder
             try
             {
                 int totalVisible = 0;
+                var viewCounts = minViewpoints > 1
+                    ? new Dictionary<int, int>() : null;
+
                 for (int v = 0; v < viewpoints.Length; v++)
                 {
                     camGo.transform.position = center + viewpoints[v] * radius;
@@ -90,12 +94,48 @@ namespace SlimShredder
                     tex.Apply();
                     RenderTexture.active = null;
 
-                    int found = DecodePixels(tex, meshMapping, result);
+                    HashSet<int> seenThisView = viewCounts != null
+                        ? new HashSet<int>() : null;
+
+                    int found = DecodePixels(tex, meshMapping, result, seenThisView);
                     totalVisible += found;
+
+                    if (seenThisView != null)
+                    {
+                        foreach (int globalIdx in seenThisView)
+                        {
+                            viewCounts.TryGetValue(globalIdx, out int c);
+                            viewCounts[globalIdx] = c + 1;
+                        }
+                    }
 
                     onProgress?.Invoke(
                         (float)(v + 1) / viewpoints.Length * 0.3f,
                         $"GPU Visibility: viewpoint {v + 1}/{viewpoints.Length}");
+                }
+
+                // Filter by minimum viewpoint votes
+                if (viewCounts != null)
+                {
+                    int removed = 0;
+                    foreach (var (mf, triOffset, triCount) in meshMapping)
+                    {
+                        var visible = result[mf];
+                        var toRemove = new List<int>();
+                        foreach (int localTri in visible)
+                        {
+                            int globalIdx = triOffset + localTri;
+                            if (!viewCounts.TryGetValue(globalIdx, out int count)
+                                || count < minViewpoints)
+                                toRemove.Add(localTri);
+                        }
+                        foreach (int tri in toRemove)
+                            visible.Remove(tri);
+                        removed += toRemove.Count;
+                    }
+
+                    Debug.Log($"[GpuVisibility] Voting filter (min={minViewpoints}): "
+                            + $"removed {removed:N0} low-confidence triangles");
                 }
 
                 Debug.Log($"[GpuVisibility] {viewpoints.Length} viewpoints, "
@@ -175,7 +215,8 @@ namespace SlimShredder
         private static int DecodePixels(
             Texture2D tex,
             List<(MeshFilter mf, int triOffset, int triCount)> meshMapping,
-            Dictionary<MeshFilter, HashSet<int>> result)
+            Dictionary<MeshFilter, HashSet<int>> result,
+            HashSet<int> seenGlobalIds = null)
         {
             var pixels = tex.GetPixels();
             int newCount = 0;
@@ -186,6 +227,7 @@ namespace SlimShredder
                 if (globalId <= 0) continue;
 
                 int triIdx = globalId - 1;
+                seenGlobalIds?.Add(triIdx);
 
                 foreach (var (mf, triOffset, triCount) in meshMapping)
                 {
